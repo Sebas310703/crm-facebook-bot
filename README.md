@@ -1,5 +1,5 @@
 # 📌 Sistema CRM con IA  
-## CRMFlow
+## Plataforma CRM integrada para la administración de campañas publicitarias y optimización del proceso de ventas
 
 ---
 
