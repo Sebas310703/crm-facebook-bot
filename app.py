@@ -1,25 +1,67 @@
-from fastapi import FastAPI, Depends, Request, HTTPException, Body
-from sqlalchemy.orm import Session
 from datetime import datetime
-from email_sender import send_pending_emails
-from pydantic import BaseModel
 import os
+import re
+
+from fastapi import FastAPI, Depends, Request, HTTPException, Body, BackgroundTasks
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from facebook_api import send_facebook_message
-
+from email_sender import send_pending_emails
+from facebook_api import send_facebook_message, send_facebook_private_reply
 from database import SessionLocal, engine
-from models import Base, Contact, Event, EmailTemplate, EmailQueue, ConversationState
+from models import (
+    Base,
+    Contact,
+    Event,
+    EmailTemplate,
+    EmailQueue,
+    ConversationState,
+)
 from automation import run_automation
 
-# Token de verificación que usarás también en Meta Developers
+# ── NURTURING ──────────────────────────────────────────────
+from nurturing_models import Base as NurturingBase
+from nurturing_engine import start_scheduler, enqueue_contact, process_pending
+from nurturing_models import NurturingLog, NurturingSequence
+# ───────────────────────────────────────────────────────────
+
+# =========================================================
+# CONFIG / CONSTANTES
+# =========================================================
+
 FACEBOOK_VERIFY_TOKEN = os.getenv("FACEBOOK_VERIFY_TOKEN", "mi_token_de_prueba")
 
+ENGAGEMENT_SCORE_MAP = {
+    "FB_LIKE": 1,
+    "FB_COMMENT": 3,
+    "FB_SHARE": 5,
+    "FB_MESSAGE": 4,
+    "FORM_COMPLETED": 6,
+}
 
-# ===================== Pydantic Schemas =====================
+COMMENT_KEYWORDS = {
+    "INFO": {
+        "reply": "👋 ¡Gracias por comentar INFO!\n\nTe escribo por aquí para ayudarte rápido.\n¿Te interesa información general o hablar con un asesor?",
+        "topic": "info",
+    },
+    "PRECIO": {
+        "reply": "💰 ¡Listo! Sobre precios: manejamos opciones según lo que necesites.\n\nPara darte un rango, ¿qué estás buscando exactamente?",
+        "topic": "precio",
+    },
+    "ASESOR": {
+        "reply": "🙋‍♂️ Perfecto. Te conecto con un asesor.\n\n¿Me confirmas tu nombre y tu WhatsApp (empieza por 3)?",
+        "topic": "asesor",
+    },
+}
+
+# =========================================================
+# Pydantic Schemas
+# =========================================================
+
 
 class ContactInfo(BaseModel):
-    user_id: str                # mismo ID que uses en user_id (ej: "fb_001" o psid)
+    user_id: str
     full_name: str | None = None
     email: str | None = None
     phone: str | None = None
@@ -30,15 +72,23 @@ class MessengerInput(BaseModel):
     text: str
 
 
-# ===================== Base de datos =====================
+# =========================================================
+# Base de datos + App
+# =========================================================
 
-# Crear las tablas automáticamente
 Base.metadata.create_all(bind=engine)
+NurturingBase.metadata.create_all(bind=engine)   # crea nurturing_sequences y nurturing_logs
 
 app = FastAPI(title="CRM Facebook")
 
 
-# Dependencia para usar la DB
+# ── Arrancar el scheduler al iniciar la app ───────────────
+@app.on_event("startup")
+def on_startup():
+    start_scheduler()
+# ─────────────────────────────────────────────────────────
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -47,45 +97,206 @@ def get_db():
         db.close()
 
 
-def get_or_create_conversation_state(db: Session, contact: Contact) -> ConversationState:
-    state = db.query(ConversationState).filter_by(
-        contact_id=contact.id,
-        channel="messenger"
-    ).first()
+# =========================================================
+# Helpers de negocio (sin cambios)
+# =========================================================
 
+
+def get_or_create_contact(
+    db: Session,
+    external_id: str,
+    default_name: str | None = None,
+) -> Contact:
+    contact = db.query(Contact).filter_by(external_id=external_id).first()
+    if not contact:
+        contact = Contact(
+            external_id=external_id,
+            full_name=default_name or "Usuario Facebook",
+        )
+        db.add(contact)
+        db.commit()
+        db.refresh(contact)
+    return contact
+
+
+def get_or_create_conversation_state(
+    db: Session,
+    contact: Contact,
+    channel: str = "messenger",
+) -> ConversationState:
+    state = (
+        db.query(ConversationState)
+        .filter_by(contact_id=contact.id, channel=channel)
+        .first()
+    )
     if not state:
         state = ConversationState(
             contact_id=contact.id,
-            channel="messenger",
-            step="start"
+            channel=channel,
+            step="start",
         )
         db.add(state)
         db.commit()
         db.refresh(state)
-
     return state
 
 
-# ===================== Rutas básicas =====================
+def update_segment_by_score(contact: Contact) -> None:
+    score = contact.engagement_score or 0
+    if score >= 40:
+        contact.segment = "muy_activo"
+    elif score >= 15:
+        contact.segment = "interesado"
+    elif score > 0:
+        contact.segment = "curioso"
+    else:
+        contact.segment = "inactivo"
+
+
+def is_valid_email(email: str) -> bool:
+    pattern = r"^[\w\.-]+@[\w\.-]+\.\w+$"
+    return re.match(pattern, email) is not None
+
+
+def is_valid_colombian_phone(phone: str) -> bool:
+    return phone.isdigit() and phone.startswith("3") and len(phone) == 10
+
+
+def register_event(
+    db: Session,
+    contact: Contact,
+    event_type: str,
+    topic: str | None = None,
+    text: str | None = None,
+    update_engagement: bool = True,
+) -> Event:
+    event = Event(
+        contact_id=contact.id,
+        event_type=event_type,
+        topic=topic,
+        text=text,
+    )
+    db.add(event)
+
+    if update_engagement:
+        if topic and not contact.main_topic:
+            contact.main_topic = topic
+
+        current_score = contact.engagement_score or 0
+        contact.engagement_score = current_score + ENGAGEMENT_SCORE_MAP.get(event_type, 0)
+        contact.last_interaction = datetime.utcnow()
+        update_segment_by_score(contact)
+
+    return event
+
+
+# =========================================================
+# Helpers comentarios (sin cambios)
+# =========================================================
+
+
+def _comment_topic(comment_id: str) -> str:
+    return f"comment_id:{comment_id}"
+
+
+def already_processed_comment(db: Session, comment_id: str) -> bool:
+    marker = _comment_topic(comment_id)
+    exists = (
+        db.query(Event)
+        .filter(Event.topic == marker)
+        .filter(Event.event_type.in_(["FB_COMMENT", "FB_PRIVATE_REPLY_SENT"]))
+        .first()
+    )
+    return exists is not None
+
+
+def detect_keyword(comment_text: str) -> str | None:
+    if not comment_text:
+        return None
+    t = comment_text.strip().upper()
+    for kw in COMMENT_KEYWORDS.keys():
+        if t == kw or kw in t:
+            return kw
+    return None
+
+
+def process_facebook_comment(
+    db: Session,
+    comment_id: str,
+    from_id: str,
+    from_name: str | None,
+    post_id: str | None,
+    comment_text: str | None,
+) -> None:
+    if not comment_id or not from_id:
+        return
+    if already_processed_comment(db, comment_id):
+        return
+
+    contact = get_or_create_contact(
+        db,
+        external_id=f"fb_user:{from_id}",
+        default_name=from_name or "Usuario Facebook",
+    )
+
+    register_event(
+        db=db,
+        contact=contact,
+        event_type="FB_COMMENT",
+        topic=_comment_topic(comment_id),
+        text=(comment_text or "").strip()[:1000],
+        update_engagement=True,
+    )
+
+    kw = detect_keyword(comment_text or "")
+    if kw:
+        reply_text = COMMENT_KEYWORDS[kw]["reply"]
+        if not contact.main_topic:
+            contact.main_topic = COMMENT_KEYWORDS[kw]["topic"]
+    else:
+        reply_text = (
+            "👋 ¡Gracias por tu comentario!\n"
+            "Te escribo por aquí para ayudarte rápido.\n\n"
+            "Escribe: INFO, PRECIO o ASESOR 🙌"
+        )
+
+    db.commit()
+
+    ok = send_facebook_private_reply(comment_id, reply_text)
+
+    register_event(
+        db=db,
+        contact=contact,
+        event_type="FB_PRIVATE_REPLY_SENT" if ok else "FB_PRIVATE_REPLY_FAILED",
+        topic=_comment_topic(comment_id),
+        text=f"post_id={post_id or 'N/A'}",
+        update_engagement=False,
+    )
+    db.commit()
+
+
+# =========================================================
+# Rutas básicas
+# =========================================================
+
 
 @app.get("/")
 def read_root():
     return {"message": "CRM Facebook funcionando 😎"}
 
 
-# ===================== WEBHOOK FACEBOOK =====================
+# =========================================================
+# WEBHOOK FACEBOOK
+# =========================================================
+
 
 @app.get("/webhook/facebook")
 async def verify_facebook_webhook(request: Request):
-    """
-    Endpoint que usa Facebook para verificar el webhook (solo GET).
-    """
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
 
     if mode == "subscribe" and token == FACEBOOK_VERIFY_TOKEN:
-        # Devuelve el challenge tal cual en texto plano
         return PlainTextResponse(challenge)
     else:
         raise HTTPException(status_code=403, detail="Verification failed")
@@ -93,24 +304,22 @@ async def verify_facebook_webhook(request: Request):
 
 @app.post("/webhook/facebook")
 async def facebook_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,           # ← agregado para nurturing
     body: dict = Body(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """
-    Recibe eventos reales desde Facebook (Messenger).
-    Para cada mensaje de texto, aplica la lógica del bot
-    y responde por Messenger usando Graph API.
-    """
     print("[FB] Webhook body:", body)
 
     entries = body.get("entry", [])
     for entry in entries:
+
+        # ─── MENSAJES MESSENGER ───────────────────────────────
         messaging_events = entry.get("messaging", [])
         for event in messaging_events:
             sender = event.get("sender", {})
             psid = sender.get("id")
 
-            # Solo manejamos mensajes de texto sencillos
             message = event.get("message")
             if not message:
                 continue
@@ -119,19 +328,18 @@ async def facebook_webhook(
             if not text:
                 continue
 
-            # ======= LÓGICA DEL BOT (igual que /messenger/simulate) =======
-            # 1. Buscar o crear contacto
-            contact = db.query(Contact).filter_by(external_id=psid).first()
-            if not contact:
-                contact = Contact(external_id=psid)
-                db.add(contact)
-                db.commit()
-                db.refresh(contact)
-
-            # 2. Obtener o crear estado de conversación
-            state = get_or_create_conversation_state(db, contact)
-
             user_text = text.strip()
+            contact = get_or_create_contact(db, external_id=psid)
+
+            register_event(
+                db=db,
+                contact=contact,
+                event_type="FB_MESSAGE",
+                topic=contact.main_topic or "general",
+                text=user_text,
+            )
+
+            state = get_or_create_conversation_state(db, contact)
             reply = ""
 
             if state.step == "start":
@@ -143,28 +351,60 @@ async def facebook_webhook(
                 state.step = "ask_email"
 
             elif state.step == "ask_email":
-                contact.email = user_text
-                state.step = "ask_phone"
-                reply = (
-                    "Perfecto, he guardado tu correo 📧.\n"
-                    "Ahora, por favor escribe tu número de WhatsApp (solo números)."
-                )
+                if not is_valid_email(user_text):
+                    reply = (
+                        "❌ El correo que escribiste no es válido.\n"
+                        "Por favor escribe un correo en formato correcto "
+                        "(ej: nombre@gmail.com)."
+                    )
+                else:
+                    contact.email = user_text
+                    state.step = "ask_phone"
+                    reply = (
+                        "✅ Correo guardado correctamente.\n"
+                        "Ahora escribe tu número de WhatsApp (debe empezar por 3)."
+                    )
 
             elif state.step == "ask_phone":
-                contact.phone = user_text
-                state.step = "completed"
-                reply = (
-                    "¡Gracias! ✅ He registrado tu correo y tu número.\n"
-                    "En breve te enviaremos información personalizada sobre el proyecto."
-                )
+                if not is_valid_colombian_phone(user_text):
+                    reply = (
+                        "❌ Ese número no es válido.\n"
+                        "Debe:\n"
+                        "• Tener 10 dígitos\n"
+                        "• Empezar por 3\n"
+                        "• Solo números\n\n"
+                        "Ejemplo válido: 3001234567"
+                    )
+                else:
+                    contact.phone = user_text
+                    state.step = "completed"
+                    reply = (
+                        "✅ ¡Perfecto! Tus datos han sido registrados correctamente.\n"
+                        "Muy pronto te enviaremos información personalizada."
+                    )
 
-                event_obj = Event(
-                    contact_id=contact.id,
-                    event_type="FORM_COMPLETED",
-                    topic=contact.main_topic or "general",
-                    text="Formulario de contacto completado vía Messenger (webhook)"
-                )
-                db.add(event_obj)
+                    register_event(
+                        db=db,
+                        contact=contact,
+                        event_type="FORM_COMPLETED",
+                        topic=contact.main_topic or "general",
+                        text="Formulario de contacto completado vía Messenger (webhook)",
+                    )
+
+                    # ── NURTURING: encolar al nuevo contacto ──────────────
+                    # Se ejecuta en background para no bloquear la respuesta
+                    # al usuario. El teléfono ya validado se convierte a E.164.
+                    telefono_e164 = f"+57{user_text}"
+                    background_tasks.add_task(
+                        enqueue_contact,
+                        db=SessionLocal(),          # sesión independiente para background
+                        contact_id=contact.id,
+                        contact_type="contact",
+                        nombre=contact.full_name or "Líder",
+                        telefono=telefono_e164,
+                        sector=contact.main_topic,  # puedes cambiar por otro campo si tienes barrio
+                    )
+                    # ─────────────────────────────────────────────────────
 
             elif state.step == "completed":
                 reply = (
@@ -172,26 +412,52 @@ async def facebook_webhook(
                     "Si tienes alguna pregunta específica, puedes escribirla y la analizaremos."
                 )
 
-            # 3. Actualizar estado
             state.last_message = user_text
             state.updated_at = datetime.utcnow()
-
             db.commit()
 
-            # 4. Enviar respuesta a Messenger (si hay token configurado)
             if reply:
                 send_facebook_message(psid, reply)
+
+        # ─── COMENTARIOS DE POSTS ─────────────────────────────
+        changes = entry.get("changes", [])
+        for change in changes:
+            if change.get("field") != "feed":
+                continue
+
+            value = change.get("value", {}) or {}
+            item = value.get("item")
+            verb = value.get("verb")
+
+            if item != "comment" or verb != "add":
+                continue
+
+            comment_id = value.get("comment_id")
+            post_id = value.get("post_id")
+            comment_text = value.get("message") or ""
+            from_obj = value.get("from") or {}
+            from_id = from_obj.get("id")
+            from_name = from_obj.get("name")
+
+            process_facebook_comment(
+                db=db,
+                comment_id=comment_id,
+                from_id=from_id,
+                from_name=from_name,
+                post_id=post_id,
+                comment_text=comment_text,
+            )
 
     return {"status": "ok"}
 
 
-# ===================== PLANTILLAS DE EMAIL =====================
+# =========================================================
+# PLANTILLAS DE EMAIL (sin cambios)
+# =========================================================
+
 
 @app.post("/init-templates")
 def init_templates(db: Session = Depends(get_db)):
-    """
-    Crea algunas plantillas básicas de email si no existen.
-    """
     templates_data = [
         {
             "name": "bienvenida",
@@ -218,7 +484,7 @@ def init_templates(db: Session = Depends(get_db)):
                 name=t["name"],
                 subject=t["subject"],
                 body=t["body"],
-                topic=None
+                topic=None,
             )
             db.add(nueva)
             creadas += 1
@@ -227,18 +493,14 @@ def init_templates(db: Session = Depends(get_db)):
     return {"status": "ok", "templates_creadas": creadas}
 
 
-# ===================== CONTACTOS / EVENTOS =====================
+# =========================================================
+# CONTACTOS / EVENTOS (sin cambios)
+# =========================================================
+
 
 @app.post("/contact/update-info")
 def update_contact_info(data: ContactInfo, db: Session = Depends(get_db)):
-    """
-    Actualiza la info de contacto (nombre, email, teléfono) para un usuario.
-    Simula que la persona te dio esos datos por un formulario o por chat.
-    """
-    contact = db.query(Contact).filter_by(external_id=data.user_id).first()
-    if not contact:
-        contact = Contact(external_id=data.user_id)
-        db.add(contact)
+    contact = get_or_create_contact(db, external_id=data.user_id)
 
     if data.full_name:
         contact.full_name = data.full_name
@@ -255,64 +517,31 @@ def update_contact_info(data: ContactInfo, db: Session = Depends(get_db)):
         "contact_id": contact.id,
         "full_name": contact.full_name,
         "email": contact.email,
-        "phone": contact.phone
+        "phone": contact.phone,
     }
 
 
 @app.post("/facebook/event")
 def receive_event(data: dict, db: Session = Depends(get_db)):
-
     fb_id = data["user_id"]
     ev_type = data["type"]
     topic = data.get("topic")
     text = data.get("text")
 
-    # 1. Buscar el contacto por su ID de Facebook
-    contact = db.query(Contact).filter_by(external_id=fb_id).first()
+    contact = get_or_create_contact(
+        db,
+        external_id=fb_id,
+        default_name="Usuario Facebook",
+    )
 
-    # 2. Si no existe, se crea automáticamente
-    if not contact:
-        contact = Contact(
-            external_id=fb_id,
-            full_name="Usuario Facebook"
-        )
-        db.add(contact)
-        db.commit()
-        db.refresh(contact)
-
-    # 3. Registrar el evento
-    event = Event(
-        contact_id=contact.id,
+    register_event(
+        db=db,
+        contact=contact,
         event_type=ev_type,
         topic=topic,
-        text=text
+        text=text,
+        update_engagement=True,
     )
-    db.add(event)
-
-    # 4. Si no tiene tema principal, asignar el de este evento
-    if topic and not contact.main_topic:
-        contact.main_topic = topic
-
-    # 5. Actualizar engagement
-    score_map = {
-        "FB_LIKE": 1,
-        "FB_COMMENT": 3,
-        "FB_SHARE": 5,
-        "FB_MESSAGE": 4
-    }
-
-    contact.engagement_score += score_map.get(ev_type, 0)
-    contact.last_interaction = datetime.utcnow()
-
-    # 6. Segmentación automática
-    if contact.engagement_score >= 40:
-        contact.segment = "muy_activo"
-    elif contact.engagement_score >= 15:
-        contact.segment = "interesado"
-    elif contact.engagement_score > 0:
-        contact.segment = "curioso"
-    else:
-        contact.segment = "inactivo"
 
     db.commit()
 
@@ -320,31 +549,28 @@ def receive_event(data: dict, db: Session = Depends(get_db)):
         "status": "evento registrado",
         "contact_id": contact.id,
         "segmento": contact.segment,
-        "score": contact.engagement_score
+        "score": contact.engagement_score,
     }
 
 
 @app.post("/messenger/simulate")
-def messenger_simulate(data: MessengerInput, db: Session = Depends(get_db)):
-    """
-    Simula una conversación de Messenger con el bot.
-    Va guiando al usuario para recoger email y teléfono.
-    """
-
-    # 1. Buscar o crear contacto
-    contact = db.query(Contact).filter_by(external_id=data.user_id).first()
-    if not contact:
-        contact = Contact(external_id=data.user_id)
-        db.add(contact)
-        db.commit()
-        db.refresh(contact)
-
-    # 2. Obtener o crear estado de conversación
-    state = get_or_create_conversation_state(db, contact)
+def messenger_simulate(
+    data: MessengerInput,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    contact = get_or_create_contact(db, external_id=data.user_id)
 
     user_text = data.text.strip()
+    register_event(
+        db=db,
+        contact=contact,
+        event_type="FB_MESSAGE",
+        topic=contact.main_topic or "general",
+        text=user_text,
+    )
 
-    # 3. Lógica de estados
+    state = get_or_create_conversation_state(db, contact)
     reply = ""
 
     if state.step == "start":
@@ -356,28 +582,58 @@ def messenger_simulate(data: MessengerInput, db: Session = Depends(get_db)):
         state.step = "ask_email"
 
     elif state.step == "ask_email":
-        contact.email = user_text
-        state.step = "ask_phone"
-        reply = (
-            "Perfecto, he guardado tu correo 📧.\n"
-            "Ahora, por favor escribe tu número de WhatsApp (solo números)."
-        )
+        if not is_valid_email(user_text):
+            reply = (
+                "❌ El correo que escribiste no es válido.\n"
+                "Por favor escribe un correo en formato correcto "
+                "(ej: nombre@gmail.com)."
+            )
+        else:
+            contact.email = user_text
+            state.step = "ask_phone"
+            reply = (
+                "✅ Correo guardado correctamente.\n"
+                "Ahora escribe tu número de WhatsApp (debe empezar por 3)."
+            )
 
     elif state.step == "ask_phone":
-        contact.phone = user_text
-        state.step = "completed"
-        reply = (
-            "¡Gracias! ✅ He registrado tu correo y tu número.\n"
-            "En breve te enviaremos información personalizada sobre el proyecto."
-        )
+        if not is_valid_colombian_phone(user_text):
+            reply = (
+                "❌ Ese número no es válido.\n"
+                "Debe:\n"
+                "• Tener 10 dígitos\n"
+                "• Empezar por 3\n"
+                "• Solo números\n\n"
+                "Ejemplo válido: 3001234567"
+            )
+        else:
+            contact.phone = user_text
+            state.step = "completed"
+            reply = (
+                "¡Gracias! ✅ He registrado tu correo y tu número.\n"
+                "En breve te enviaremos información personalizada sobre el proyecto."
+            )
 
-        event = Event(
-            contact_id=contact.id,
-            event_type="FORM_COMPLETED",
-            topic=contact.main_topic or "general",
-            text="Formulario de contacto completado vía Messenger"
-        )
-        db.add(event)
+            register_event(
+                db=db,
+                contact=contact,
+                event_type="FORM_COMPLETED",
+                topic=contact.main_topic or "general",
+                text="Formulario de contacto completado vía Messenger (simulado)",
+            )
+
+            # ── NURTURING: encolar al nuevo contacto ──────────────
+            telefono_e164 = f"+57{user_text}"
+            background_tasks.add_task(
+                enqueue_contact,
+                db=SessionLocal(),
+                contact_id=contact.id,
+                contact_type="contact",
+                nombre=contact.full_name or "Líder",
+                telefono=telefono_e164,
+                sector=contact.main_topic,
+            )
+            # ─────────────────────────────────────────────────────
 
     elif state.step == "completed":
         reply = (
@@ -385,11 +641,8 @@ def messenger_simulate(data: MessengerInput, db: Session = Depends(get_db)):
             "Si tienes alguna pregunta específica, puedes escribirla y la analizaremos."
         )
 
-    # 4. Actualizar estado
     state.last_message = user_text
     state.updated_at = datetime.utcnow()
-
-    # 5. Guardar cambios de contacto + estado
     db.commit()
 
     return {
@@ -399,19 +652,20 @@ def messenger_simulate(data: MessengerInput, db: Session = Depends(get_db)):
         "contact": {
             "id": contact.id,
             "email": contact.email,
-            "phone": contact.phone
-        }
+            "phone": contact.phone,
+            "segment": contact.segment,
+            "engagement_score": contact.engagement_score,
+        },
     }
 
 
-# ===================== AUTOMATIZACIÓN Y EMAILS =====================
+# =========================================================
+# AUTOMATIZACIÓN Y EMAILS (sin cambios)
+# =========================================================
+
 
 @app.post("/automation/run")
 def run_automation_endpoint(db: Session = Depends(get_db)):
-    """
-    Ejecuta el motor de automatización.
-    Revisa contactos y programa emails en la cola.
-    """
     run_automation(db)
     pendientes = db.query(EmailQueue).filter_by(status="PENDING").count()
     return {"status": "automation_ejecutada", "emails_pendientes": pendientes}
@@ -419,25 +673,49 @@ def run_automation_endpoint(db: Session = Depends(get_db)):
 
 @app.get("/emails/pending")
 def get_pending_emails(db: Session = Depends(get_db)):
-    """
-    Lista los emails pendientes de envío.
-    """
     emails = db.query(EmailQueue).filter_by(status="PENDING").all()
     resultado = []
     for e in emails:
-        resultado.append({
-            "id": e.id,
-            "contact_id": e.contact_id,
-            "template_id": e.template_id,
-            "scheduled_at": e.scheduled_at
-        })
+        resultado.append(
+            {
+                "id": e.id,
+                "contact_id": e.contact_id,
+                "template_id": e.template_id,
+                "scheduled_at": e.scheduled_at,
+            }
+        )
     return resultado
 
 
-@app.post("/emails/send-pending")
-def send_emails_endpoint(db: Session = Depends(get_db)):
+# =========================================================
+# NURTURING — endpoints de administración
+# =========================================================
+
+
+@app.get("/nurturing/stats")
+def nurturing_stats(db: Session = Depends(get_db)):
+    """Estado actual de todos los mensajes programados."""
+    from sqlalchemy import func
+    stats = (
+        db.query(NurturingLog.status, func.count(NurturingLog.id))
+        .group_by(NurturingLog.status)
+        .all()
+    )
+    return {status: count for status, count in stats}
+
+
+@app.post("/nurturing/encolar-lideres")
+def encolar_lideres_existentes():
     """
-    Simula el envío de todos los emails en estado PENDING.
+    Encola la secuencia completa para los 800 líderes ya existentes.
+    Ejecutar UNA sola vez desde Swagger en /docs.
     """
-    enviados = send_pending_emails(db)
-    return {"status": "ok", "emails_enviados": enviados}
+    from nurturing_engine import enqueue_lideres_existentes
+    total = enqueue_lideres_existentes()
+    return {"mensajes_programados": total}
+
+
+@app.post("/nurturing/procesar-ahora")
+def procesar_ahora():
+    """Fuerza el envío inmediato de mensajes pendientes. Útil para pruebas."""
+    return process_pending(batch_size=5)
