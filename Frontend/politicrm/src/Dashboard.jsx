@@ -30,7 +30,6 @@ const Barrios = [
   { id: 26, nombre: "Brisas del Nariño",    meta: 1500, actual: 620,  lider: "Pedro López",    estado: "danger",  simpatizantes: 620,  indecisos: 540, opositores: 210 },
   { id: 27, nombre: "Limites",              meta: 800,  actual: 790,  lider: "Luisa Valencia", estado: "green",   simpatizantes: 790,  indecisos: 110, opositores: 55  },
   { id: 28, nombre: "20 de Julio",          meta: 1100, actual: 1050, lider: "Diego Ríos",     estado: "green",   simpatizantes: 1050, indecisos: 140, opositores: 60  },
-  { id: 29, nombre: "La Pampa",             meta: 600,  actual: 210,  lider: "Sin asignar",    estado: "danger",  simpatizantes: 210,  indecisos: 280, opositores: 95  },
   { id: 30, nombre: "La Esperanza Alta",    meta: 1200, actual: 980,  lider: "Carlos Mesa",    estado: "warning", simpatizantes: 1140, indecisos: 320, opositores: 88  },
   { id: 31, nombre: "Montevideo 1",         meta: 900,  actual: 870,  lider: "Ana Puentes",    estado: "green",   simpatizantes: 870,  indecisos: 95,  opositores: 41  },
   { id: 32, nombre: "Montevideo 2",         meta: 1500, actual: 620,  lider: "Pedro López",    estado: "danger",  simpatizantes: 620,  indecisos: 540, opositores: 210 },
@@ -41,7 +40,12 @@ const Barrios = [
   { id: 37, nombre: "Lomitas",              meta: 900,  actual: 870,  lider: "Ana Puentes",    estado: "green",   simpatizantes: 870,  indecisos: 95,  opositores: 41  },
   { id: 38, nombre: "Bocono",               meta: 1500, actual: 620,  lider: "Pedro López",    estado: "danger",  simpatizantes: 620,  indecisos: 540, opositores: 210 },
   { id: 39, nombre: "La Esperanza Baja",    meta: 800,  actual: 790,  lider: "Luisa Valencia", estado: "green",   simpatizantes: 790,  indecisos: 110, opositores: 55  },
-  { id: 40, nombre: "El Refugio",           meta: 600,  actual: 380,  lider: "Sin asignar",    estado: "warning", simpatizantes: 380,  indecisos: 190, opositores: 70  },
+  { id: 40, nombre: "Pueblito Español",     meta: 600,  actual: 380,  lider: "Sin asignar",    estado: "warning", simpatizantes: 380,  indecisos: 190, opositores: 70  },
+  { id: 41, nombre: "Senderos de Paz",      meta: 600,  actual: 380,  lider: "Sin asignar",    estado: "warning", simpatizantes: 380,  indecisos: 190, opositores: 70  },
+  { id: 42, nombre: "Altos de Buenavista",  meta: 600,  actual: 380,  lider: "Sin asignar",    estado: "warning", simpatizantes: 380,  indecisos: 190, opositores: 70  },
+  { id: 43, nombre: "Buenavista I",  meta: 600,  actual: 380,  lider: "Sin asignar",    estado: "warning", simpatizantes: 380,  indecisos: 190, opositores: 70  },
+  { id: 44, nombre: "Buenavista II",  meta: 600,  actual: 380,  lider: "Sin asignar",    estado: "warning", simpatizantes: 380,  indecisos: 190, opositores: 70  },
+  { id: 45, nombre: "Monaco",  meta: 600,  actual: 380,  lider: "Sin asignar",    estado: "warning", simpatizantes: 380,  indecisos: 190, opositores: 70  },
 ];
 
 const ALERTAS = [
