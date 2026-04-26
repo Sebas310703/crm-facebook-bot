@@ -509,7 +509,7 @@ export default function Dashboard({ onGoLanding }) {
             <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10, background: "#0f1e35" }}>
               <div style={{ width: 32, height: 32, borderRadius: "50%", background: "linear-gradient(135deg,#7c3aed,#db2777)", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 12, flexShrink: 0 }}>AG</div>
               <div style={{ overflow: "hidden" }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "#e2e8f0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>Adriana González</div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#e2e8f0", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>Carlos Julio Socha Hernandez</div>
                 <div style={{ fontSize: 10, color: "#334155" }}>Admin</div>
               </div>
             </div>
@@ -523,7 +523,7 @@ export default function Dashboard({ onGoLanding }) {
         <div style={{ height: 60, background: "#080f1f", borderBottom: "1px solid #111e35", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 24px", flexShrink: 0 }}>
           <div>
             <span style={{ fontWeight: 800, fontSize: 18, color: "#f1f5f9" }}>{activeLabel}</span>
-            <span style={{ fontSize: 12, color: "#334155", marginLeft: 10 }}>Campaña Adriana González 2027</span>
+            <span style={{ fontSize: 12, color: "#334155", marginLeft: 10 }}>Campaña Carlos Julio Socha Hernandez 2027</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <span style={{ fontSize: 12, color: "#334155" }}>🕐 {hora}</span>
