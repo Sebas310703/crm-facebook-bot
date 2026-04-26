@@ -41,6 +41,7 @@ class LiderSeguro(Base):
 
     id         = Column(Integer, primary_key=True, index=True)
     nombre     = Column(String(150), nullable=False, index=True)
+    cedula     = Column(String(30),  nullable=True,  index=True) 
     telefono   = Column(String(60),  nullable=True,  index=True)
     direccion  = Column(String(300), nullable=True)
     barrio_id  = Column(Integer, ForeignKey("barrios.id"), nullable=False, index=True)
